@@ -1,0 +1,199 @@
+import numpy as np
+import cv2 as cv
+import glob
+
+# Constants
+CHESSBOARD_SIZE = (
+10, 7)  # Number of intersecting corners of squares on the largest perimeter of the chessboard (width, height)
+SIZE_OF_CHESSBOARD_SQUARES_IN_MM = 25
+MARKER_SIZE_IN_CM = 10
+REFERENCE_DISTANCE_TO_CAMERA_IN_CM = 50
+ERROR_CORRECTION_IN_CM = 23 #Determined empirically, found out during experimentation
+
+
+#Loads AruCo detector
+parameters = cv.aruco.DetectorParameters_create()
+aruco_dict =cv.aruco.Dictionary_get(cv.aruco.DICT_4X4_100)
+
+
+answer = input("Do you want to see the calibrated frame? 'y' or 'n'")
+
+camera_number = 0
+
+
+def calibration(get_calibrated_frame): # Does the Calibration of the Camera and returns the Camera Matrix and Distortion Coefficients
+
+    # FINDS CHESSBOARD CORNERS - OBJECT POINTS AND IMAGE POINTS
+
+    # Termination criteria for finding the subpixels on the corners
+    criteria = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+
+
+    # Populates the object points for the chessboard using unitary units
+    objp = np.zeros((CHESSBOARD_SIZE[0] * CHESSBOARD_SIZE[1], 3), np.float32)
+    objp[:,:2] = np.mgrid[0:CHESSBOARD_SIZE[0], 0:CHESSBOARD_SIZE[1]].T.reshape(-1, 2)
+
+
+    objp = objp * SIZE_OF_CHESSBOARD_SQUARES_IN_MM # Populates the array with the coordinates in mm
+
+
+    # Arrays to store object points and image points from all the images.
+    obj_points = [] # 3d points in real world space
+    img_points = [] # 2d points in image plane
+
+
+    calibration_images = glob.glob('*.jpg') # Gets all the 'jpg' images  in the folder to use for calibration
+
+    for image in calibration_images:
+
+        img = cv.imread(image)
+        gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
+
+        # Finds the chessboard corners for each calibration image
+        chess_successful, chess_corners = cv.findChessboardCorners(gray, CHESSBOARD_SIZE, None)
+
+        # If found, add object points, image points (after refining them trough subpixels)
+        if chess_successful == True:
+            print(str(image) + " used successfully for calibration")
+            obj_points.append(objp)
+            corners_refined = cv.cornerSubPix(gray, chess_corners, (11, 11), (-1, -1), criteria)
+            img_points.append(chess_corners)
+
+            # Draw and display the corners
+            cv.drawChessboardCorners(img, CHESSBOARD_SIZE, corners_refined, chess_successful)
+            cv.imshow('img', img)
+            cv.waitKey(300)
+        else:
+            print(str(image) + " was not possible to be used for calibration, try again in a different lightning condition/ background")
+
+    cv.destroyAllWindows()
+
+
+
+
+    # CALIBRATION
+
+    img = cv.imread('WIN_20220728_18_28_40_Pro.jpg') # Exact photo doesn't matter
+    h,  w = img.shape[:2]  # Gets the resolution of the camera used from a photo
+
+    calibration_successful, camera_matrix, distortion, rvecs, tvecs = cv.calibrateCamera(obj_points, img_points, (w, h), None, None)
+
+    print("Camera Matrix:\n", camera_matrix)
+    print("Distortion Coefficients:\n", distortion)
+
+    # UNDISTORTION
+
+    if get_calibrated_frame.lower() == "y":
+
+        newCameraMatrix, roi = cv.getOptimalNewCameraMatrix(camera_matrix, distortion, (w, h), 1, (w, h))
+
+        # Undistort
+        dst = cv.undistort(img, camera_matrix, distortion, None, newCameraMatrix)
+
+        # crop the image and saves it
+        x, y, w, h = roi
+        dst = dst[y:y+h, x:x+w]
+        cv.imwrite('Calibration_Result.jpg', dst)
+
+
+    # REPROJECTION ERROR
+    mean_error = 0
+
+    for i in range(len(obj_points)):
+        imgpoints2, _ = cv.projectPoints(obj_points[i], rvecs[i], tvecs[i], camera_matrix, distortion)
+        error = cv.norm(img_points[i], imgpoints2, cv.NORM_L2) / len(imgpoints2)
+        mean_error += error
+
+    if (mean_error / len(obj_points)) >= 0.1:
+        print ("total error of the calibration: {}".format(mean_error / len(obj_points)) + " (please try to calibrate again)")
+    else:
+        print( "total error of the calibration: {} ".format(mean_error / len(obj_points)) + " (the error seems acceptable)")
+
+    return camera_matrix, distortion
+
+
+
+
+
+
+
+
+
+def reference_for_px(): #Calibration in order to use pixels (px) to get the estimated distance, returns focal_length
+
+    # Detection of the AruCo
+    ref_frame = cv.imread("RefImage50cm.jpg") #gets reference frame
+    corners_ref, arucoIds, _ = cv.aruco.detectMarkers(ref_frame, aruco_dict, parameters = parameters) #Detects the coordinates of the aruco corners plus somethings that doesnt mattter
+    ref_frame = cv.aruco.drawDetectedMarkers(ref_frame, corners_ref, arucoIds) #Draws around the aruco
+
+    # Aruco Perimeter and px
+    aruco_ref_perimeter_px = cv.arcLength(corners_ref[0], True)
+    aruco_ref_side_px = aruco_ref_perimeter_px / 4
+
+    # Calculates the necessary parameters for the calculation using pixels
+    focal_length = (aruco_ref_side_px * REFERENCE_DISTANCE_TO_CAMERA_IN_CM) / MARKER_SIZE_IN_CM
+
+    return focal_length
+
+
+
+
+def video_tracking(camera_matrix, distortion, focal_length, camera_number): #Does the live video tracking and distance of the AruCos
+
+
+    camera = cv.VideoCapture (camera_number)
+
+    #Will display the videocapture until someone presses "x" to stop
+
+    while True:
+
+        camera_successful, frame = camera.read() # The frame is a np array that representes the image
+        corners, arucoIds, _ = cv.aruco.detectMarkers(frame, aruco_dict, parameters = parameters) #Detects the coordinates and the ids of the aruco corners plus somethings that doesnt mattter
+
+        if arucoIds is not None: # When the aruco is detected it goes to perform the necessary operations
+
+            rvecAruco, tvecAruco, _ = cv.aruco.estimatePoseSingleMarkers(corners, MARKER_SIZE_IN_CM, camera_matrix, distortion) # Gets the rotation and translation vectors of the aruco
+            tvecAruco = tvecAruco.flatten() #gets rid of the array -> array -> array
+
+            # For every aruco in the array of detected arucos...
+            for i in range(len(arucoIds)):
+
+                calculated_distance_arucINcm = int(abs(( tvecAruco[0 + (i * 3)]) - ERROR_CORRECTION_IN_CM)) # Calculates the distance by gettting every value of z of each individual aruco in the array
+
+                aruco_perimeter_px = cv.arcLength(corners[0], True) # Calculates the pixels based on the referance frame
+                aruco_side_px = aruco_perimeter_px / 4
+
+                # Finds the coordinates of the center of the aruco
+                center = corners[i][0]
+                M = cv.moments(center)
+                cX = int(M["m10"] / M["m00"])
+                cY = int(M["m01"] / M["m00"])
+
+
+                calculated_distance_pxINcm = int(((focal_length * MARKER_SIZE_IN_CM) / aruco_side_px) - ERROR_CORRECTION_IN_CM) # Calculates the distance by pixels
+
+                Avg = int((calculated_distance_pxINcm + calculated_distance_arucINcm) / 2) # Does the average of the two methods
+
+                # Displays the desired values on the AruCos
+                cv.putText(frame, str(calculated_distance_pxINcm) + " cm(px)  / " + str(calculated_distance_arucINcm) + " cm(aruc)", (cX - 80, cY - 40), cv.FONT_HERSHEY_COMPLEX, 0.5, (0, 255, 0), 2)
+                cv.putText(frame, "Avg" + str(Avg) + " cm", (cX - 20, cY - 70), cv.FONT_HERSHEY_COMPLEX, 0.5, (0, 255, 0), 2)
+
+        frame = cv.aruco.drawDetectedMarkers(frame, corners, arucoIds) # Draws around and puts an id on the aruco markers
+
+        cv.imshow("LIVE                                 click \"x\" to escape", frame) #Display the frames gotten by the camera device
+
+
+        if cv.waitKey(1) == ord("x"): # if pressed "x" it breaks the loop
+            break
+
+    camera.release()
+    cv.destroyAllWindows()
+
+
+
+if __name__ == '__main__':
+    camera_matrix, distortion = calibration(answer)  # Does the Calibration of the Camera and gets the Camera Matrix and Distortion Coefficients
+
+    focal_length = reference_for_px()  # Does the necessary operations using a reference frame of a known distance to use pixels as a distance calculator
+
+    video_tracking(camera_matrix, distortion, focal_length, camera_number) # Launch camera tracking
